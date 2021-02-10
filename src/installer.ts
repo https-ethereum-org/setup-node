@@ -6,7 +6,7 @@ import * as io from '@actions/io';
 import * as tc from '@actions/tool-cache';
 import * as path from 'path';
 import * as semver from 'semver';
-import {Url} from 'url';
+import fs = require('fs');
 
 //
 // Node versions interface
@@ -19,7 +19,6 @@ export interface INodeVersion {
 
 interface INodeVersionInfo {
   downloadUrl: string;
-  token: string | null;
   resolvedVersion: string;
   fileName: string;
 }
@@ -27,13 +26,12 @@ interface INodeVersionInfo {
 export async function getNode(
   versionSpec: string,
   stable: boolean,
-  token: string
+  auth: string | undefined
 ) {
   let osPlat: string = os.platform();
   let osArch: string = translateArchToDistUrl(os.arch());
 
   // check cache
-  let info: INodeVersionInfo | null = null;
   let toolPath: string;
   toolPath = tc.find('node', versionSpec);
 
@@ -42,48 +40,91 @@ export async function getNode(
     console.log(`Found in cache @ ${toolPath}`);
   } else {
     console.log(`Attempting to download ${versionSpec}...`);
-    let info = await getInfoFromManifest(versionSpec, stable, token);
-    if (!info) {
-      console.log(
-        'Not found in manifest.  Falling back to download directly from Node'
-      );
-      info = await getInfoFromDist(versionSpec);
-    }
-
-    if (!info) {
-      throw new Error(
-        `Unable to find Node version '${versionSpec}' for platform ${osPlat} and architecture ${osArch}.`
-      );
-    }
-
-    console.log(`Acquiring ${info.resolvedVersion} from ${info.downloadUrl}`);
-
     let downloadPath = '';
+    let info: INodeVersionInfo | null = null;
+
+    //
+    // Try download from internal distribution (popular versions only)
+    //
     try {
-      downloadPath = await tc.downloadTool(info.downloadUrl, undefined, token);
+      info = await getInfoFromManifest(versionSpec, stable, auth);
+      if (info) {
+        console.log(
+          `Acquiring ${info.resolvedVersion} from ${info.downloadUrl}`
+        );
+        downloadPath = await tc.downloadTool(info.downloadUrl, undefined, auth);
+      } else {
+        console.log(
+          'Not found in manifest.  Falling back to download directly from Node'
+        );
+      }
     } catch (err) {
-      if (err instanceof tc.HTTPError && err.httpStatusCode == 404) {
-        return await acquireNodeFromFallbackLocation(info.resolvedVersion);
+      // Rate limit?
+      if (
+        err instanceof tc.HTTPError &&
+        (err.httpStatusCode === 403 || err.httpStatusCode === 429)
+      ) {
+        console.log(
+          `Received HTTP status code ${err.httpStatusCode}.  This usually indicates the rate limit has been exceeded`
+        );
+      } else {
+        console.log(err.message);
+      }
+      core.debug(err.stack);
+      console.log('Falling back to download directly from Node');
+    }
+
+    //
+    // Download from nodejs.org
+    //
+    if (!downloadPath) {
+      info = await getInfoFromDist(versionSpec);
+      if (!info) {
+        throw new Error(
+          `Unable to find Node version '${versionSpec}' for platform ${osPlat} and architecture ${osArch}.`
+        );
       }
 
-      throw err;
+      console.log(`Acquiring ${info.resolvedVersion} from ${info.downloadUrl}`);
+      try {
+        downloadPath = await tc.downloadTool(info.downloadUrl);
+      } catch (err) {
+        if (err instanceof tc.HTTPError && err.httpStatusCode == 404) {
+          return await acquireNodeFromFallbackLocation(info.resolvedVersion);
+        }
+
+        throw err;
+      }
     }
 
     //
     // Extract
     //
+    console.log('Extracting ...');
     let extPath: string;
+    info = info || ({} as INodeVersionInfo); // satisfy compiler, never null when reaches here
     if (osPlat == 'win32') {
       let _7zPath = path.join(__dirname, '..', 'externals', '7zr.exe');
       extPath = await tc.extract7z(downloadPath, undefined, _7zPath);
+      // 7z extracts to folder matching file name
+      let nestedPath = path.join(extPath, path.basename(info.fileName, '.7z'));
+      if (fs.existsSync(nestedPath)) {
+        extPath = nestedPath;
+      }
     } else {
-      extPath = await tc.extractTar(downloadPath);
+      extPath = await tc.extractTar(downloadPath, undefined, [
+        'xz',
+        '--strip',
+        '1'
+      ]);
     }
 
     //
     // Install into the local tool cache - node extracts with a root folder that matches the fileName downloaded
     //
+    console.log('Adding to the cache ...');
     toolPath = await tc.cacheDir(extPath, 'node', info.resolvedVersion);
+    console.log('Done');
   }
 
   //
@@ -103,13 +144,13 @@ export async function getNode(
 async function getInfoFromManifest(
   versionSpec: string,
   stable: boolean,
-  token: string
+  auth: string | undefined
 ): Promise<INodeVersionInfo | null> {
   let info: INodeVersionInfo | null = null;
   const releases = await tc.getManifestFromRepo(
     'actions',
     'node-versions',
-    token
+    auth
   );
   console.log(`matching ${versionSpec}...`);
   const rel = await tc.findFromManifest(versionSpec, stable, releases);
@@ -119,7 +160,6 @@ async function getInfoFromManifest(
     info.resolvedVersion = rel.version;
     info.downloadUrl = rel.files[0].download_url;
     info.fileName = rel.files[0].filename;
-    info.token = token;
   }
 
   return info;
@@ -131,7 +171,6 @@ async function getInfoFromDist(
   let osPlat: string = os.platform();
   let osArch: string = translateArchToDistUrl(os.arch());
 
-  let info: INodeVersionInfo | null = null;
   let version: string;
 
   version = await queryDistForMatch(versionSpec);
@@ -262,6 +301,8 @@ async function acquireNodeFromFallbackLocation(
     exeUrl = `https://nodejs.org/dist/v${version}/win-${osArch}/node.exe`;
     libUrl = `https://nodejs.org/dist/v${version}/win-${osArch}/node.lib`;
 
+    console.log(`Downloading only node binary from ${exeUrl}`);
+
     const exePath = await tc.downloadTool(exeUrl);
     await io.cp(exePath, path.join(tempDir, 'node.exe'));
     const libPath = await tc.downloadTool(libUrl);
@@ -279,7 +320,9 @@ async function acquireNodeFromFallbackLocation(
       throw err;
     }
   }
-  return await tc.cacheDir(tempDir, 'node', version);
+  let toolPath = await tc.cacheDir(tempDir, 'node', version);
+  core.addPath(toolPath);
+  return toolPath;
 }
 
 // os.arch does not always match the relative download url, e.g.
